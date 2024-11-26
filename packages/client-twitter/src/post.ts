@@ -102,10 +102,39 @@ class ConversationCache {
         this.username = username;
     }
 
-    async isParticipating(conversationId: string): Promise<boolean> {
+    private getKey(conversationId: string): string {
+        return `twitter/${this.username}/conversations/${conversationId}`;
+    }
+
+    async isParticipating(tweet: Tweet): Promise<boolean> {
         try {
-            const key = `twitter/${this.username}/conversations/${conversationId}`;
-            return !!(await this.runtime.cacheManager.get<ConversationData>(key));
+            // Check if we're participating in this conversation
+            const conversationKey = this.getKey(tweet.conversationId);
+            const conversationData = await this.runtime.cacheManager.get<ConversationData>(conversationKey);
+
+            if (conversationData) {
+                elizaLogger.debug(`Already participating in conversation ${tweet.conversationId}`);
+                return true;
+            }
+
+            // Also check if this is part of a thread we're already in
+            if (tweet.inReplyToStatusId) {
+                const parentTweet = await this.runtime.cacheManager.get<Tweet>(
+                    `twitter/${this.username}/tweets/${tweet.inReplyToStatusId}`
+                );
+                
+                if (parentTweet) {
+                    const parentConversationKey = this.getKey(parentTweet.conversationId);
+                    const parentConversationData = await this.runtime.cacheManager.get<ConversationData>(parentConversationKey);
+                    
+                    if (parentConversationData) {
+                        elizaLogger.debug(`Tweet ${tweet.id} is part of conversation ${parentTweet.conversationId} we're already in`);
+                        return true;
+                    }
+                }
+            }
+
+            return false;
         } catch (error) {
             elizaLogger.error("Error checking conversation participation:", error);
             return false;
@@ -114,12 +143,20 @@ class ConversationCache {
 
     async markParticipating(tweet: Tweet): Promise<void> {
         try {
-            const key = `twitter/${this.username}/conversations/${tweet.conversationId}`;
-            await this.runtime.cacheManager.set(key, {
+            // Store conversation data
+            const conversationKey = this.getKey(tweet.conversationId);
+            await this.runtime.cacheManager.set(conversationKey, {
                 timestamp: Date.now(),
                 replies: [tweet.id],
                 lastReplyId: tweet.id
             });
+
+            // Cache the tweet itself for future reference
+            await this.runtime.cacheManager.set(
+                `twitter/${this.username}/tweets/${tweet.id}`,
+                tweet
+            );
+
             elizaLogger.debug(`Marked participating in conversation ${tweet.conversationId}`);
         } catch (error) {
             elizaLogger.error("Error marking conversation participation:", error);
@@ -208,39 +245,38 @@ export class TwitterPostClient {
         return `${interaction.handle} ${template}`;
     };
 
-    #validateTweetForReply = async (tweet: Tweet): Promise<boolean> => {
-        try {
-            const cache = await this.ensureInitialized();
+#validateTweetForReply = async (tweet: Tweet): Promise<boolean> => {
+    try {
+        const cache = await this.ensureInitialized();
 
-            // Skip self-tweets
-            if (tweet.username === this.client.profile.username) {
-                elizaLogger.debug(`Skipping own tweet ${tweet.id}`);
-                return false;
-            }
-
-            // Check tweet age
-            const tweetAge = Date.now() - new Date(tweet.timestamp).getTime();
-            if (tweetAge > REPLY_AGE_LIMIT_MS) {
-                elizaLogger.debug(`Tweet ${tweet.id} is too old (${Math.floor(tweetAge / (24 * 60 * 60 * 1000))} days)`);
-                return false;
-            }
-
-            // Check if already participating
-            const isParticipating = await cache.isParticipating(tweet.conversationId);
-            if (isParticipating) {
-                elizaLogger.debug(`Already participated in conversation ${tweet.conversationId}`);
-                return false;
-            }
-
-            // Mark as participating
-            await cache.markParticipating(tweet);
-            return true;
-
-        } catch (error) {
-            elizaLogger.error("Error validating tweet for reply:", error);
+        // Skip self-tweets
+        if (tweet.username === this.client.profile.username) {
+            elizaLogger.debug(`Skipping own tweet ${tweet.id}`);
             return false;
         }
-    };
+
+        // Check tweet age
+        const tweetAge = Date.now() - new Date(tweet.timestamp).getTime();
+        if (tweetAge > REPLY_AGE_LIMIT_MS) {
+            elizaLogger.debug(`Tweet ${tweet.id} is too old (${Math.floor(tweetAge / (24 * 60 * 60 * 1000))} days)`);
+            return false;
+        }
+
+        // Check if we're already in this conversation or thread
+        const isParticipating = await cache.isParticipating(tweet);
+        if (isParticipating) {
+            return false;
+        }
+
+        // Mark as participating immediately
+        await cache.markParticipating(tweet);
+        return true;
+
+    } catch (error) {
+        elizaLogger.error("Error validating tweet for reply:", error);
+        return false;
+    }
+};
 
     #postTweet = async (content: string): Promise<Tweet | null> => {
         try {
@@ -429,30 +465,30 @@ export class TwitterPostClient {
         elizaLogger.log("Twitter post client stopped");
     }
 
-    async processNewTweet(tweet: Tweet): Promise<void> {
-        try {
-            const cache = await this.ensureInitialized();
-            
-            // Check if already in conversation
-            const isParticipating = await cache.isParticipating(tweet.conversationId);
-            if (isParticipating) {
-                elizaLogger.debug(`Skipping tweet ${tweet.id} - already in conversation ${tweet.conversationId}`);
-                return;
-            }
-
-            // Validate tweet
-            const isValid = await this.#validateTweetForReply(tweet);
-            if (!isValid) {
-                return;
-            }
-
-            elizaLogger.debug(`Processing new tweet ${tweet.id}`);
-            // Add your tweet processing logic here
-            
-        } catch (error) {
-            elizaLogger.error("Error processing tweet:", error);
+async processNewTweet(tweet: Tweet): Promise<void> {
+    try {
+        const cache = await this.ensureInitialized();
+        
+        // Check if already in conversation or thread
+        const isParticipating = await cache.isParticipating(tweet);
+        if (isParticipating) {
+            elizaLogger.debug(`Skipping tweet ${tweet.id} - already in conversation/thread`);
+            return;
         }
+
+        // Validate tweet
+        const isValid = await this.#validateTweetForReply(tweet);
+        if (!isValid) {
+            return;
+        }
+
+        elizaLogger.debug(`Processing new tweet ${tweet.id}`);
+        // Add your tweet processing logic here
+        
+    } catch (error) {
+        elizaLogger.error("Error processing tweet:", error);
     }
+}
 
     async generateNewTweet(): Promise<void> {
         elizaLogger.log("Generating new tweet");
