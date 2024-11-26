@@ -27,7 +27,7 @@ const SPECIAL_INTERACTIONS: Record<string, SpecialInteraction> = {
             "Paper hands never make generational wealth... just saying",
             "Some influencers talk diamond hands but fold faster than a lawn chair"
         ],
-        probability: 0.15 // 15% chance of Tate interaction
+        probability: 0.15
     },
     hailey: {
         handle: "@HaileyWelchX",
@@ -38,7 +38,7 @@ const SPECIAL_INTERACTIONS: Record<string, SpecialInteraction> = {
             "When are we partnering to make history?",
             "Your energy + my vision = Willy tuah Billy"
         ],
-        probability: 0.15 // 15% chance of Hailey interaction
+        probability: 0.15
     },
     dolos: {
         handle: "@dolos_diary",
@@ -50,7 +50,7 @@ const SPECIAL_INTERACTIONS: Record<string, SpecialInteraction> = {
             "Size matters in this game, and someone's coming up short",
             "While others play with their mini Willies, we're building generational wealth"
         ],
-        probability: 0.15 // 15% chance of Dolos interaction
+        probability: 0.15
     }
 };
 
@@ -79,6 +79,7 @@ Special Interactions:
 2. Occasionally flirt with @HaileyWelchX about partnering for 'Willy tuah Billy'`;
 
 const MAX_TWEET_LENGTH = 280;
+const REPLY_AGE_LIMIT_MS = 5 * 24 * 60 * 60 * 1000; // 5 days in milliseconds
 
 function truncateToCompleteSentence(text: string): string {
     if (text.length <= MAX_TWEET_LENGTH) {
@@ -108,6 +109,7 @@ export class TwitterPostClient {
     client: ClientBase;
     runtime: IAgentRuntime;
     private lastInteractionType: string | null = null;
+    private isRunning: boolean = false;
 
     constructor(client: ClientBase, runtime: IAgentRuntime) {
         this.client = client;
@@ -115,7 +117,6 @@ export class TwitterPostClient {
     }
 
     private shouldGenerateSpecialInteraction(): string | null {
-        // Don't do special interactions back-to-back
         if (this.lastInteractionType) {
             this.lastInteractionType = null;
             return null;
@@ -141,39 +142,94 @@ export class TwitterPostClient {
         return `${interaction.handle} ${template}`;
     }
 
+    private async validateTweetForReply(tweet: Tweet): Promise<boolean> {
+        try {
+            // Check tweet age
+            const tweetDate = new Date(tweet.timestamp).getTime();
+            const ageInMs = Date.now() - tweetDate;
+            
+            if (ageInMs > REPLY_AGE_LIMIT_MS) {
+                elizaLogger.debug(`Tweet ${tweet.id} is too old (${Math.floor(ageInMs / (24 * 60 * 60 * 1000))} days)`);
+                return false;
+            }
+
+            // Check if already replied in thread
+            const threadKey = `twitter/${this.client.profile.username}/threads/${tweet.conversationId}`;
+            const threadReplies = await this.runtime.cacheManager.get<{
+                replies: string[];
+                lastReplyTimestamp: number;
+            }>(threadKey);
+
+            if (threadReplies) {
+                elizaLogger.debug(`Already replied in thread ${tweet.conversationId}`);
+                return false;
+            }
+
+            return true;
+        } catch (error) {
+            elizaLogger.error("Error validating tweet for reply:", error);
+            return false;
+        }
+    }
+
+    private async trackReplyInThread(tweet: Tweet): Promise<void> {
+        try {
+            const threadKey = `twitter/${this.client.profile.username}/threads/${tweet.conversationId}`;
+            await this.runtime.cacheManager.set(threadKey, {
+                replies: [tweet.id],
+                lastReplyTimestamp: Date.now()
+            });
+        } catch (error) {
+            elizaLogger.error("Error tracking reply in thread:", error);
+        }
+    }
+
     async start(postImmediately: boolean = false) {
+        if (this.isRunning) {
+            elizaLogger.warn("Twitter post client is already running");
+            return;
+        }
+
+        this.isRunning = true;
+
         if (!this.client.profile) {
             await this.client.init();
         }
 
         const generateNewTweetLoop = async () => {
-            const lastPost = await this.runtime.cacheManager.get<{
-                timestamp: number;
-            }>(
-                "twitter/" +
+            try {
+                const lastPost = await this.runtime.cacheManager.get<{
+                    timestamp: number;
+                }>(
+                    "twitter/" +
                     this.runtime.getSetting("TWITTER_USERNAME") +
                     "/lastPost"
-            );
+                );
 
-            const lastPostTimestamp = lastPost?.timestamp ?? 0;
-            const minMinutes =
-                parseInt(this.runtime.getSetting("POST_INTERVAL_MIN")) || 90;
-            const maxMinutes =
-                parseInt(this.runtime.getSetting("POST_INTERVAL_MAX")) || 180;
-            const randomMinutes =
-                Math.floor(Math.random() * (maxMinutes - minMinutes + 1)) +
-                minMinutes;
-            const delay = randomMinutes * 60 * 1000;
+                const lastPostTimestamp = lastPost?.timestamp ?? 0;
+                const minMinutes = parseInt(this.runtime.getSetting("POST_INTERVAL_MIN")) || 90;
+                const maxMinutes = parseInt(this.runtime.getSetting("POST_INTERVAL_MAX")) || 180;
+                const randomMinutes = Math.floor(Math.random() * (maxMinutes - minMinutes + 1)) + minMinutes;
+                const delay = randomMinutes * 60 * 1000;
 
-            if (Date.now() > lastPostTimestamp + delay) {
-                await this.generateNewTweet();
+                if (Date.now() > lastPostTimestamp + delay) {
+                    await this.generateNewTweet();
+                }
+
+                if (this.isRunning) {
+                    setTimeout(() => {
+                        generateNewTweetLoop();
+                    }, delay);
+                    elizaLogger.log(`Next tweet scheduled in ${randomMinutes} minutes`);
+                }
+            } catch (error) {
+                elizaLogger.error("Error in tweet loop:", error);
+                if (this.isRunning) {
+                    setTimeout(() => {
+                        generateNewTweetLoop();
+                    }, 5 * 60 * 1000); // Retry after 5 minutes
+                }
             }
-
-            setTimeout(() => {
-                generateNewTweetLoop();
-            }, delay);
-
-            elizaLogger.log(`Next tweet scheduled in ${randomMinutes} minutes`);
         };
 
         if (postImmediately) {
@@ -181,6 +237,32 @@ export class TwitterPostClient {
         }
 
         generateNewTweetLoop();
+    }
+
+    async stop() {
+        this.isRunning = false;
+        elizaLogger.log("Twitter post client stopped");
+    }
+
+    async processNewTweet(tweet: Tweet): Promise<void> {
+        try {
+            // Skip if tweet is from self
+            if (tweet.username === this.client.profile.username) {
+                return;
+            }
+
+            // Validate tweet for reply
+            const isValid = await this.validateTweetForReply(tweet);
+            if (!isValid) {
+                return;
+            }
+
+            // Process the tweet and generate reply logic here
+            // Your existing reply generation logic goes here
+            
+        } catch (error) {
+            elizaLogger.error("Error processing new tweet:", error);
+        }
     }
 
     private async generateNewTweet() {
@@ -201,13 +283,17 @@ export class TwitterPostClient {
                 content = this.generateSpecialInteraction(specialInteractionType);
             } else {
                 let homeTimeline: Tweet[] = [];
-                const cachedTimeline = await this.client.getCachedTimeline();
-
-                if (cachedTimeline) {
-                    homeTimeline = cachedTimeline;
-                } else {
-                    homeTimeline = await this.client.fetchHomeTimeline(10);
-                    await this.client.cacheTimeline(homeTimeline);
+                try {
+                    const cachedTimeline = await this.client.getCachedTimeline();
+                    if (cachedTimeline) {
+                        homeTimeline = cachedTimeline;
+                    } else {
+                        homeTimeline = await this.client.fetchHomeTimeline(10);
+                        await this.client.cacheTimeline(homeTimeline);
+                    }
+                } catch (error) {
+                    elizaLogger.error("Error fetching timeline:", error);
+                    homeTimeline = [];
                 }
 
                 const formattedHomeTimeline =
@@ -227,7 +313,7 @@ export class TwitterPostClient {
                         agentId: this.runtime.agentId,
                         content: {
                             text: topics,
-                            action: "",
+                            action: "post",
                         },
                     },
                     {
@@ -259,9 +345,7 @@ export class TwitterPostClient {
             content = truncateToCompleteSentence(content);
 
             if (this.runtime.getSetting("TWITTER_DRY_RUN") === "true") {
-                elizaLogger.info(
-                    `Dry run: would have posted tweet: ${content}`
-                );
+                elizaLogger.info(`Dry run: would have posted tweet: ${content}`);
                 return;
             }
 
@@ -269,9 +353,13 @@ export class TwitterPostClient {
                 elizaLogger.log(`Posting new tweet:\n ${content}`);
 
                 const result = await this.client.requestQueue.add(
-                    async () =>
-                        await this.client.twitterClient.sendTweet(content)
+                    async () => await this.client.twitterClient.sendTweet(content)
                 );
+                
+                if (!result.ok) {
+                    throw new Error(`Failed to post tweet: ${result.status} ${result.statusText}`);
+                }
+
                 const body = await result.json();
                 const tweetResult = body.data.create_tweet.tweet_results.result;
 
@@ -283,8 +371,7 @@ export class TwitterPostClient {
                     conversationId: tweetResult.legacy.conversation_id_str,
                     createdAt: tweetResult.legacy.created_at,
                     userId: this.client.profile.id,
-                    inReplyToStatusId:
-                        tweetResult.legacy.in_reply_to_status_id_str,
+                    inReplyToStatusId: tweetResult.legacy.in_reply_to_status_id_str,
                     permanentUrl: `https://twitter.com/${this.runtime.getSetting("TWITTER_USERNAME")}/status/${tweetResult.rest_id}`,
                     hashtags: [],
                     mentions: [],
@@ -305,7 +392,7 @@ export class TwitterPostClient {
                 await this.client.cacheTweet(tweet);
 
                 const homeTimeline = await this.client.getCachedTimeline() || [];
-                homeTimeline.push(tweet);
+                homeTimeline.unshift(tweet);
                 await this.client.cacheTimeline(homeTimeline);
                 elizaLogger.log(`Tweet posted:\n ${tweet.permanentUrl}`);
 
@@ -330,13 +417,140 @@ export class TwitterPostClient {
                     },
                     roomId,
                     embedding: embeddingZeroVector,
-                    createdAt: tweet.timestamp * 1000,
+createdAt: new Date(tweet.createdAt).getTime(),
                 });
             } catch (error) {
                 elizaLogger.error("Error sending tweet:", error);
+                throw error;
             }
         } catch (error) {
             elizaLogger.error("Error generating new tweet:", error);
+            throw error;
         }
     }
+
+    async reply(tweet: Tweet, content: string): Promise<Tweet | null> {
+        try {
+            // Validate before replying
+            const isValid = await this.validateTweetForReply(tweet);
+            if (!isValid) {
+                elizaLogger.debug(`Skipping reply to tweet ${tweet.id} - validation failed`);
+                return null;
+            }
+
+            content = truncateToCompleteSentence(content);
+
+            if (this.runtime.getSetting("TWITTER_DRY_RUN") === "true") {
+                elizaLogger.info(`Dry run: would have replied to tweet ${tweet.id}: ${content}`);
+                return null;
+            }
+
+            elizaLogger.log(`Replying to tweet ${tweet.id}:\n ${content}`);
+
+            const result = await this.client.requestQueue.add(
+                async () => await this.client.twitterClient.reply(content, tweet.id)
+            );
+
+            if (!result.ok) {
+                throw new Error(`Failed to post reply: ${result.status} ${result.statusText}`);
+            }
+
+            const body = await result.json();
+            const tweetResult = body.data.create_tweet.tweet_results.result;
+
+            const replyTweet = {
+                id: tweetResult.rest_id,
+                name: this.client.profile.screenName,
+                username: this.client.profile.username,
+                text: tweetResult.legacy.full_text,
+                conversationId: tweet.conversationId,
+                timestamp: new Date(tweetResult.legacy.created_at).getTime(),
+                userId: this.client.profile.id,
+                inReplyToStatusId: tweet.id,
+                permanentUrl: `https://twitter.com/${this.runtime.getSetting("TWITTER_USERNAME")}/status/${tweetResult.rest_id}`,
+                hashtags: [],
+                mentions: [],
+                photos: [],
+                thread: [],
+                urls: [],
+                videos: [],
+            } as Tweet;
+
+            // Track the reply in thread
+            await this.trackReplyInThread(replyTweet);
+
+            // Cache the reply tweet
+            await this.client.cacheTweet(replyTweet);
+
+            // Update timeline cache
+            const homeTimeline = await this.client.getCachedTimeline() || [];
+            homeTimeline.unshift(replyTweet);
+            await this.client.cacheTimeline(homeTimeline);
+
+            // Create memory of the reply
+            const roomId = stringToUuid(tweet.conversationId + "-" + this.runtime.agentId);
+            await this.runtime.ensureRoomExists(roomId);
+            await this.runtime.ensureParticipantInRoom(this.runtime.agentId, roomId);
+
+            await this.runtime.messageManager.createMemory({
+                id: stringToUuid(replyTweet.id + "-" + this.runtime.agentId),
+                userId: this.runtime.agentId,
+                agentId: this.runtime.agentId,
+                content: {
+                    text: content.trim(),
+                    url: replyTweet.permanentUrl,
+                    source: "twitter",
+                    inReplyTo: tweet.id,
+                },
+                roomId,
+                embedding: embeddingZeroVector,
+                createdAt: replyTweet.timestamp,
+            });
+
+            elizaLogger.log(`Reply posted: ${replyTweet.permanentUrl}`);
+            return replyTweet;
+
+        } catch (error) {
+            elizaLogger.error(`Error replying to tweet ${tweet.id}:`, error);
+            return null;
+        }
+    }
+}
+
+// Utility function to clean up old thread records
+export async function cleanupOldThreadRecords(client: TwitterPostClient): Promise<void> {
+    try {
+        const threadKeys = await client.runtime.cacheManager.keys(`twitter/${client.client.profile.username}/threads/*`);
+        const now = Date.now();
+        const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+        for (const key of threadKeys) {
+            const threadData = await client.runtime.cacheManager.get<{
+                replies: string[];
+                lastReplyTimestamp: number;
+            }>(key);
+            if (threadData && (now - threadData.lastReplyTimestamp > maxAge)) {
+                await client.runtime.cacheManager.delete(key);
+                elizaLogger.debug(`Cleaned up old thread record: ${key}`);
+            }
+        }
+    } catch (error) {
+        elizaLogger.error("Error cleaning up old thread records:", error);
+    }
+}
+
+// Helper to initialize the client with cleanup routine
+export async function initializeTwitterClient(
+    client: ClientBase, 
+    runtime: IAgentRuntime,
+    cleanupInterval: number = 24 * 60 * 60 * 1000 // Default to daily cleanup
+): Promise<TwitterPostClient> {
+    const twitterClient = new TwitterPostClient(client, runtime);
+
+    // Set up periodic cleanup
+    setInterval(async () => {
+        await cleanupOldThreadRecords(twitterClient);
+    }, cleanupInterval);
+
+    return twitterClient;
 }
