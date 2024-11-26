@@ -13,6 +13,8 @@ import { ClientBase } from "./base.ts";
 import { SpecialInteraction, validateTwitterConfig } from "./environment.ts";
 import { sample } from 'lodash';
 
+const MAX_TWEET_LENGTH = 280;
+
 const twitterPostTemplate = `{{timeline}}
 
 # Knowledge
@@ -31,14 +33,18 @@ About {{agentName}} (@{{twitterUserName}}):
 
 # Task: Generate a post in the voice and style of {{agentName}}, aka @{{twitterUserName}}
 Write a single sentence post that is {{adjective}} about {{topic}} (without mentioning {{topic}} directly), from the perspective of {{agentName}}. Try to write something totally different than previous posts. Do not add commentary or acknowledge this request, just write the post.
-Your response should not contain any questions. Brief, concise statements only. use emojis. use hashtags #Willy, #WillytoaBilly, #WillytuahBilly, #BeleiveWithUs, #WillysBelievers, #ArmyofBelievers, #NothingPumpsHarder  Use \\n\\n (double spaces) between statements.
-
-const MAX_TWEET_LENGTH = 280;
+Your response should not contain any questions. Brief, concise statements only. No emojis. Use \\n\\n (double spaces) between statements.`;
 
 interface PostSchedule {
     minMinutes: number;
     maxMinutes: number;
     lastPostTime: number;
+}
+
+interface PostResponse {
+    content: string;
+    isSpecialInteraction: boolean;
+    interactionType?: string;
 }
 
 /**
@@ -84,45 +90,86 @@ export class TwitterPostClient {
         this.client = client;
         this.runtime = runtime;
         
-        // Initialize schedule with defaults or from runtime settings
         this.schedule = {
             minMinutes: parseInt(runtime.getSetting("POST_INTERVAL_MIN")) || 90,
             maxMinutes: parseInt(runtime.getSetting("POST_INTERVAL_MAX")) || 180,
             lastPostTime: 0
         };
 
-        this.specialInteractionCooldown = 24 * 60 * 60 * 1000; // Default 24h
+        this.specialInteractionCooldown = 24 * 60 * 60 * 1000;
     }
 
-    private async loadSpecialInteractions() {
+    private async loadSpecialInteractions(): Promise<void> {
         try {
             const config = await validateTwitterConfig(this.runtime);
             this.specialInteractions = config.TWITTER_SPECIAL_INTERACTIONS;
             this.specialInteractionCooldown = config.TWITTER_SPECIAL_INTERACTION_COOLDOWN;
 
-            // Initialize tracking for all configured interactions
             Object.keys(this.specialInteractions).forEach(key => {
                 this.lastSpecialInteraction[key] = 0;
             });
 
-            elizaLogger.log(`Loaded ${Object.keys(this.specialInteractions).length} special interactions`);
-            elizaLogger.debug("Special interactions configured:", 
-                Object.keys(this.specialInteractions));
+            elizaLogger.log("Loaded special interactions:", Object.keys(this.specialInteractions).length);
+            elizaLogger.debug("Configured interactions:", Object.keys(this.specialInteractions));
         } catch (error) {
             elizaLogger.error("Error loading special interactions:", error);
             this.specialInteractions = {};
         }
     }
 
-    async start(postImmediately: boolean = false) {
+    private shouldTriggerSpecialInteraction(type: string): boolean {
+        const now = Date.now();
+        const lastTime = this.lastSpecialInteraction[type] || 0;
+        const interaction = this.specialInteractions[type];
+
+        if (!interaction) {
+            return false;
+        }
+
+        if (now - lastTime < this.specialInteractionCooldown) {
+            elizaLogger.debug(`Special interaction ${type} on cooldown: ${Math.floor((this.specialInteractionCooldown - (now - lastTime)) / 1000 / 60)}m remaining`);
+            return false;
+        }
+
+        const shouldTrigger = Math.random() < interaction.probability;
+        if (shouldTrigger) {
+            elizaLogger.log(`Triggering special interaction: ${type}`);
+        }
+        return shouldTrigger;
+    }
+
+    private async generateSpecialTweet(type: string): Promise<PostResponse | null> {
+        const interaction = this.specialInteractions[type];
+        if (!interaction) {
+            return null;
+        }
+
+        const template = sample(interaction.templates);
+        const topic = sample(interaction.topics);
+
+        if (!template || !topic) {
+            elizaLogger.warn(`Missing template or topic for interaction ${type}`);
+            return null;
+        }
+
+        const content = `${interaction.handle} ${template}`;
+        this.lastSpecialInteraction[type] = Date.now();
+
+        elizaLogger.log(`Generated special tweet for ${type}: ${content}`);
+        return {
+            content,
+            isSpecialInteraction: true,
+            interactionType: type
+        };
+    }
+
+    async start(postImmediately: boolean = false): Promise<void> {
         if (!this.client.profile) {
             await this.client.init();
         }
 
-        // Load special interactions
         await this.loadSpecialInteractions();
 
-        // Load last post time from cache
         const lastPost = await this.runtime.cacheManager.get<{
             timestamp: number;
         }>(
@@ -130,7 +177,7 @@ export class TwitterPostClient {
         );
         this.schedule.lastPostTime = lastPost?.timestamp ?? 0;
 
-        const generateNewTweetLoop = async () => {
+        const generateNewTweetLoop = async (): Promise<void> => {
             try {
                 const now = Date.now();
                 const timeSinceLastPost = now - this.schedule.lastPostTime;
@@ -144,24 +191,17 @@ export class TwitterPostClient {
                     await this.generateNewTweet();
                 }
 
-                // Schedule next tweet
                 setTimeout(() => generateNewTweetLoop(), delay);
-
                 elizaLogger.log(`Next tweet scheduled in ${randomMinutes} minutes`);
             } catch (error) {
                 elizaLogger.error("Error in tweet generation loop:", error);
-                // Retry after delay on error
                 setTimeout(() => generateNewTweetLoop(), 5 * 60 * 1000);
             }
         };
 
-        if (
-            this.runtime.getSetting("POST_IMMEDIATELY") != null &&
-            this.runtime.getSetting("POST_IMMEDIATELY") !== ""
-        ) {
-            postImmediately = parseBooleanFromText(
-                this.runtime.getSetting("POST_IMMEDIATELY")
-            );
+        const shouldPostImmediately = this.runtime.getSetting("POST_IMMEDIATELY");
+        if (shouldPostImmediately != null && shouldPostImmediately !== "") {
+            postImmediately = parseBooleanFromText(shouldPostImmediately);
         }
 
         if (postImmediately) {
@@ -171,51 +211,85 @@ export class TwitterPostClient {
         generateNewTweetLoop();
     }
 
-    private shouldTriggerSpecialInteraction(type: string): boolean {
-        const now = Date.now();
-        const lastTime = this.lastSpecialInteraction[type] || 0;
-        const interaction = this.specialInteractions[type];
-
-        if (!interaction) return false;
-
-        // Check cooldown
-        if (now - lastTime < this.specialInteractionCooldown) {
-            elizaLogger.debug(`Special interaction ${type} on cooldown for ${Math.floor((this.specialInteractionCooldown - (now - lastTime)) / 1000 / 60)} more minutes`);
-            return false;
+    private async generateTweetContent(): Promise<PostResponse> {
+        // Check for special interactions first
+        const interactionTypes = Object.keys(this.specialInteractions);
+        const randomType = sample(interactionTypes);
+        
+        if (randomType && this.shouldTriggerSpecialInteraction(randomType)) {
+            const specialTweet = await this.generateSpecialTweet(randomType);
+            if (specialTweet) {
+                return specialTweet;
+            }
         }
 
-        // Random chance based on probability
-        const shouldTrigger = Math.random() < interaction.probability;
-        if (shouldTrigger) {
-            elizaLogger.log(`Triggering special interaction: ${type}`);
+        // Generate normal tweet if no special interaction
+        let homeTimeline: Tweet[] = [];
+        const cachedTimeline = await this.client.getCachedTimeline();
+
+        if (cachedTimeline) {
+            homeTimeline = cachedTimeline;
+        } else {
+            homeTimeline = await this.client.fetchHomeTimeline(10);
+            await this.client.cacheTimeline(homeTimeline);
         }
-        return shouldTrigger;
+
+        const formattedHomeTimeline =
+            `# ${this.runtime.character.name}'s Home Timeline\n\n` +
+            homeTimeline
+                .map((tweet) => {
+                    return `#${tweet.id}\n${tweet.name} (@${tweet.username})${
+                        tweet.inReplyToStatusId
+                            ? `\nIn reply to: ${tweet.inReplyToStatusId}`
+                            : ""
+                    }\n${new Date(tweet.timestamp * 1000).toDateString()}\n\n${
+                        tweet.text
+                    }\n---\n`;
+                })
+                .join("\n");
+
+        const topics = this.runtime.character.topics.join(", ");
+
+        const state = await this.runtime.composeState(
+            {
+                userId: this.runtime.agentId,
+                roomId: stringToUuid("twitter_generate_room"),
+                agentId: this.runtime.agentId,
+                content: {
+                    text: topics,
+                    action: "",
+                },
+            },
+            {
+                twitterUserName: this.client.profile.username,
+                timeline: formattedHomeTimeline,
+            }
+        );
+
+        const context = composeContext({
+            state,
+            template:
+                this.runtime.character.templates?.twitterPostTemplate ||
+                twitterPostTemplate,
+        });
+
+        const newTweetContent = await generateText({
+            runtime: this.runtime,
+            context,
+            modelClass: ModelClass.SMALL,
+        });
+
+        const formattedTweet = newTweetContent
+            .replaceAll(/\\n/g, "\n")
+            .trim();
+
+        return {
+            content: truncateToCompleteSentence(formattedTweet),
+            isSpecialInteraction: false
+        };
     }
 
-    private async generateSpecialTweet(type: string): Promise<string | null> {
-        const interaction = this.specialInteractions[type];
-        if (!interaction) return null;
-
-        // Get a random template and topic
-        const template = sample(interaction.templates);
-        const topic = sample(interaction.topics);
-
-        if (!template || !topic) {
-            elizaLogger.warn(`Missing template or topic for special interaction ${type}`);
-            return null;
-        }
-
-        // Create tweet with mention
-        const tweet = `${interaction.handle} ${template}`;
-
-        // Update last interaction time
-        this.lastSpecialInteraction[type] = Date.now();
-
-        elizaLogger.log(`Generated special tweet for ${type}: ${tweet}`);
-        return tweet;
-    }
-
-    private async generateNewTweet() {
+    private async generateNewTweet(): Promise<void> {
         if (this.isPosting) {
             elizaLogger.log("Tweet generation already in progress, skipping");
             return;
@@ -225,103 +299,28 @@ export class TwitterPostClient {
         elizaLogger.log("Generating new tweet");
 
         try {
-            // Check for special interactions first
-            let content: string | null = null;
-            
-            // Randomly select one special interaction type to check
-            const interactionTypes = Object.keys(this.specialInteractions);
-            const randomType = sample(interactionTypes);
-            
-            if (randomType && this.shouldTriggerSpecialInteraction(randomType)) {
-                content = await this.generateSpecialTweet(randomType);
-            }
+            await this.runtime.ensureUserExists(
+                this.runtime.agentId,
+                this.client.profile.username,
+                this.runtime.character.name,
+                "twitter"
+            );
 
-            // If no special interaction, generate normal tweet
-            if (!content) {
-                await this.runtime.ensureUserExists(
-                    this.runtime.agentId,
-                    this.client.profile.username,
-                    this.runtime.character.name,
-                    "twitter"
-                );
-
-                let homeTimeline: Tweet[] = [];
-                const cachedTimeline = await this.client.getCachedTimeline();
-
-                if (cachedTimeline) {
-                    homeTimeline = cachedTimeline;
-                } else {
-                    homeTimeline = await this.client.fetchHomeTimeline(10);
-                    await this.client.cacheTimeline(homeTimeline);
-                }
-
-                const formattedHomeTimeline =
-                    `# ${this.runtime.character.name}'s Home Timeline\n\n` +
-                    homeTimeline
-                        .map((tweet) => {
-                            return `#${tweet.id}\n${tweet.name} (@${tweet.username})${
-                                tweet.inReplyToStatusId
-                                    ? `\nIn reply to: ${tweet.inReplyToStatusId}`
-                                    : ""
-                            }\n${new Date(tweet.timestamp * 1000).toDateString()}\n\n${
-                                tweet.text
-                            }\n---\n`;
-                        })
-                        .join("\n");
-
-                const topics = this.runtime.character.topics.join(", ");
-
-                const state = await this.runtime.composeState(
-                    {
-                        userId: this.runtime.agentId,
-                        roomId: stringToUuid("twitter_generate_room"),
-                        agentId: this.runtime.agentId,
-                        content: {
-                            text: topics,
-                            action: "",
-                        },
-                    },
-                    {
-                        twitterUserName: this.client.profile.username,
-                        timeline: formattedHomeTimeline,
-                    }
-                );
-
-                const context = composeContext({
-                    state,
-                    template:
-                        this.runtime.character.templates?.twitterPostTemplate ||
-                        twitterPostTemplate,
-                });
-
-                const newTweetContent = await generateText({
-                    runtime: this.runtime,
-                    context,
-                    modelClass: ModelClass.SMALL,
-                });
-
-                // Replace \n with proper line breaks and trim excess spaces
-                const formattedTweet = newTweetContent
-                    .replaceAll(/\\n/g, "\n")
-                    .trim();
-
-                content = truncateToCompleteSentence(formattedTweet);
-            }
-
-            if (!content) {
+            const tweetResponse = await this.generateTweetContent();
+            if (!tweetResponse.content) {
                 elizaLogger.warn("No content generated for tweet");
                 return;
             }
 
             if (this.runtime.getSetting("TWITTER_DRY_RUN") === "true") {
-                elizaLogger.info(`Dry run: would have posted tweet: ${content}`);
+                elizaLogger.info(`Dry run: would have posted tweet: ${tweetResponse.content}`);
                 return;
             }
 
-            elizaLogger.log(`Posting new tweet:\n ${content}`);
+            elizaLogger.log(`Posting new tweet:\n ${tweetResponse.content}`);
 
             const result = await this.client.requestQueue.add(
-                async () => await this.client.twitterClient.sendTweet(content)
+                async () => await this.client.twitterClient.sendTweet(tweetResponse.content)
             );
             const body = await result.json();
             const tweetResult = body.data.create_tweet.tweet_results.result;
@@ -354,6 +353,7 @@ export class TwitterPostClient {
             const postInfo = {
                 id: tweet.id,
                 timestamp: Date.now(),
+                type: tweetResponse.isSpecialInteraction ? tweetResponse.interactionType : 'normal'
             };
             await this.runtime.cacheManager.set(
                 `twitter/${this.client.profile.username}/lastPost`,
@@ -379,9 +379,13 @@ export class TwitterPostClient {
                 userId: this.runtime.agentId,
                 agentId: this.runtime.agentId,
                 content: {
-                    text: content.trim(),
+                    text: tweetResponse.content.trim(),
                     url: tweet.permanentUrl,
                     source: "twitter",
+                    metadata: {
+                        isSpecialInteraction: tweetResponse.isSpecialInteraction,
+                        interactionType: tweetResponse.interactionType
+                    }
                 },
                 roomId,
                 embedding: embeddingZeroVector,
@@ -395,3 +399,5 @@ export class TwitterPostClient {
         }
     }
 }
+
+export default TwitterPostClient;
