@@ -1,6 +1,6 @@
 {
     "name": "willy",
-    "clients": [],
+    "clients": ["twitter","telegram"],
     "modelProvider": "openai",
     "settings": {
         "secrets": {},
