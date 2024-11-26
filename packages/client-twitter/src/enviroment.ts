@@ -1,7 +1,7 @@
 // environment.ts
 
-import { IAgentRuntime } from "@ai16z/eliza";
 import { z } from "zod";
+import { IAgentRuntime, elizaLogger } from "@ai16z/eliza";
 
 export interface SpecialInteraction {
     handle: string;
