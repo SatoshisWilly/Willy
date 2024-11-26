@@ -66,6 +66,7 @@ Response options are RESPOND, IGNORE and STOP.
 If a message is not interesting or relevant, {{agentName}} should IGNORE.
 Unless directly RESPONDing to a user, {{agentName}} should IGNORE messages that are very short or do not contain much information.
 If a user asks {{agentName}} to stop talking, {{agentName}} should STOP.
+{{agentName}} should only reply once max on a thread conversation.
 If {{agentName}} concludes a conversation and isn't part of the conversation anymore, {{agentName}} should STOP.
 
 {{recentPosts}}
@@ -84,10 +85,12 @@ Thread of Tweets You Are Replying To:
 export class TwitterInteractionClient {
     client: ClientBase;
     runtime: IAgentRuntime;
+    private processedTweetIds: Set<string>;
 
     constructor(client: ClientBase, runtime: IAgentRuntime) {
         this.client = client;
         this.runtime = runtime;
+        this.processedTweetIds = new Set<string>();
     }
 
     async start() {
@@ -96,74 +99,91 @@ export class TwitterInteractionClient {
             setTimeout(
                 handleTwitterInteractionsLoop,
                 (Math.floor(Math.random() * (5 - 2 + 1)) + 2) * 60 * 1000
-            ); // Random interval between 2-5 minutes
+            );
         };
         handleTwitterInteractionsLoop();
     }
 
-async handleTwitterInteractions() {
-    elizaLogger.log("Checking Twitter interactions");
+    async handleTwitterInteractions() {
+        elizaLogger.log("Checking Twitter interactions");
 
-    const twitterUsername = this.client.profile.username;
+        const twitterUsername = this.client.profile.username;
 
-    try {
-        // Fetch recent mentions
-        const tweetCandidates = (
-            await this.client.fetchSearchTweets(
-                `@${twitterUsername}`,
-                20,
-                SearchMode.Latest
-            )
-        ).tweets;
+        try {
+            // Load previously processed tweets from cache
+            await this.loadProcessedTweetsFromCache();
 
-        // Deduplicate and sort tweets
-        const uniqueTweetCandidates = [...new Set(tweetCandidates)]
-            .sort((a, b) => a.id.localeCompare(b.id))
-            .filter((tweet) => tweet.userId !== this.client.profile.id); // Exclude self-tweets
+            // Fetch recent mentions
+            const tweetCandidates = (
+                await this.client.fetchSearchTweets(
+                    `@${twitterUsername}`,
+                    20,
+                    SearchMode.Latest
+                )
+            ).tweets;
 
-        // Filter out tweets asynchronously (e.g., already replied or spam)
-        const filteredCandidates: Tweet[] = [];
-        for (const tweet of uniqueTweetCandidates) {
-            if (!(await this.hasRepliedToTweet(tweet.id)) && !this.isSpam(tweet)) {
-                filteredCandidates.push(tweet);
+            // Deduplicate and sort tweets
+            const uniqueTweetCandidates = [...new Set(tweetCandidates)]
+                .sort((a, b) => a.id.localeCompare(b.id))
+                .filter((tweet) => 
+                    tweet.userId !== this.client.profile.id && // Exclude self-tweets
+                    !this.processedTweetIds.has(tweet.id) && // Exclude already processed tweets
+                    !this.isSpam(tweet) // Exclude spam
+                );
+
+            for (const tweet of uniqueTweetCandidates) {
+                if (
+                    !this.client.lastCheckedTweetId ||
+                    parseInt(tweet.id) > parseInt(this.client.lastCheckedTweetId)
+                ) {
+                    elizaLogger.log("Processing new tweet:", tweet.permanentUrl);
+
+                    const thread = await buildConversationThread(tweet);
+
+                    await this.handleTweet({
+                        tweet,
+                        message: {
+                            content: { text: tweet.text },
+                            agentId: this.runtime.agentId,
+                            userId: stringToUuid(tweet.userId!),
+                            roomId: stringToUuid(
+                                tweet.conversationId + "-" + this.runtime.agentId
+                            ),
+                        },
+                        thread,
+                    });
+
+                    // Mark tweet as processed both in memory and cache
+                    this.processedTweetIds.add(tweet.id);
+                    await this.markTweetAsProcessed(tweet.id);
+                }
             }
-        }
 
-        for (const tweet of filteredCandidates) {
-            if (
-                !this.client.lastCheckedTweetId ||
-                parseInt(tweet.id) > this.client.lastCheckedTweetId
-            ) {
-                elizaLogger.log("New Tweet found", tweet.permanentUrl);
-
-                const thread = await this.buildConversationThread(tweet);
-
-                await this.handleTweet({
-                    tweet,
-                    message: {
-                        content: { text: tweet.text },
-                        agentId: this.runtime.agentId,
-                        userId: stringToUuid(tweet.userId!),
-                        roomId: stringToUuid(
-                            tweet.conversationId + "-" + this.runtime.agentId
-                        ),
-                    },
-                    thread,
-                });
-
-                // Mark tweet as replied after processing
-                await this.markTweetAsReplied(tweet.id);
+            // Update the latest checked tweet ID
+            if (uniqueTweetCandidates.length > 0) {
+                const latestTweet = uniqueTweetCandidates[uniqueTweetCandidates.length - 1];
+                this.client.lastCheckedTweetId = parseInt(latestTweet.id);
+                await this.client.cacheLatestCheckedTweetId();
             }
-        }
 
-        // Save the latest checked tweet ID
-        await this.client.cacheLatestCheckedTweetId();
-        elizaLogger.log("Finished checking Twitter interactions");
-    } catch (error) {
-        elizaLogger.error("Error handling Twitter interactions:", error);
+            elizaLogger.log("Finished checking Twitter interactions");
+        } catch (error) {
+            elizaLogger.error("Error handling Twitter interactions:", error);
+        }
     }
-}
 
+    private async loadProcessedTweetsFromCache() {
+        const processedTweets = await this.runtime.cacheManager.get<string[]>("processed_tweets") || [];
+        processedTweets.forEach(id => this.processedTweetIds.add(id));
+    }
+
+    private async markTweetAsProcessed(tweetId: string) {
+        // Store in cache with a TTL
+        const processedTweets = Array.from(this.processedTweetIds);
+        await this.runtime.cacheManager.set("processed_tweets", processedTweets, {
+            ttl: 30 * 24 * 60 * 60 // 30 days
+        });
+    }
 
     private async handleTweet({
         tweet,
@@ -195,16 +215,6 @@ async handleTwitterInteractions() {
                 elizaLogger.error(`Error sending response tweet: ${error}`);
             }
         }
-    }
-
-    private async hasRepliedToTweet(tweetId: string): Promise<boolean> {
-        const repliedKey = `twitter/replied/${tweetId}`;
-        return !!(await this.runtime.cacheManager.get<boolean>(repliedKey));
-    }
-
-    private async markTweetAsReplied(tweetId: string): Promise<void> {
-        const repliedKey = `twitter/replied/${tweetId}`;
-        await this.runtime.cacheManager.set(repliedKey, true, { ttl: 30 * 24 * 60 * 60 }); // Cache for 30 days
     }
 
     private async shouldRespondToTweet(
