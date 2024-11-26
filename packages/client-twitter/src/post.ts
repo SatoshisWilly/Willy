@@ -10,8 +10,8 @@ import {
     elizaLogger,
 } from "@ai16z/eliza";
 import { ClientBase } from "./base";
-import type { SpecialInteraction } from "./environment.ts";
-import { validateTwitterConfig } from "./environment.ts";
+import type { SpecialInteraction } from "./enviroment.ts";
+import { validateTwitterConfig } from "./enviroment.ts";
 import { sample } from 'lodash';
 
 const MAX_TWEET_LENGTH = 280;
