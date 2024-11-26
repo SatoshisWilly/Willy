@@ -1,3 +1,4 @@
+// index.ts
 import { Tweet } from "agent-twitter-client";
 import {
     composeContext,
@@ -96,6 +97,20 @@ function truncateToCompleteSentence(text: string): string {
     return text.slice(0, MAX_TWEET_LENGTH - 3).trim() + "...";
 }
 
+// Event handler that blocks all tweet-related events
+function blockTweetEvents(event: any): void {
+    if (event?.type === 'tweet' || event?.type === 'reply' || event?.type === 'mention') {
+        elizaLogger.debug('Blocked tweet event:', event.type);
+        return;
+    }
+}
+
+export interface TwitterClientConfig {
+    postIntervalMin?: number;
+    postIntervalMax?: number;
+    dryRun?: boolean;
+}
+
 export class TwitterPostClient {
     client: ClientBase;
     runtime: IAgentRuntime;
@@ -106,6 +121,14 @@ export class TwitterPostClient {
     constructor(client: ClientBase, runtime: IAgentRuntime) {
         this.client = client;
         this.runtime = runtime;
+
+        // Block all tweet-related events at initialization
+        if (runtime.eventEmitter) {
+            runtime.eventEmitter.on('*', blockTweetEvents);
+            runtime.eventEmitter.on('tweet', () => null);
+            runtime.eventEmitter.on('reply', () => null);
+            runtime.eventEmitter.on('mention', () => null);
+        }
     }
 
     private async initialize(): Promise<void> {
@@ -115,6 +138,23 @@ export class TwitterPostClient {
             }
             this.isInitialized = true;
         }
+    }
+
+    // Override these methods to completely block any reply functionality
+    async processNewTweet(_tweet: Tweet): Promise<void> {
+        return;
+    }
+
+    async processIncomingEvent(_event: any): Promise<void> {
+        return;
+    }
+
+    async reply(_tweet: Tweet, _content: string): Promise<Tweet | null> {
+        return null;
+    }
+
+    async handleMention(_tweet: Tweet): Promise<void> {
+        return;
     }
 
     #shouldGenerateSpecialInteraction = (): string | null => {
@@ -165,7 +205,6 @@ export class TwitterPostClient {
 
     #updateCachesAndMemory = async (tweet: Tweet, content: string): Promise<void> => {
         try {
-            // Update last post cache
             await this.runtime.cacheManager.set(
                 `twitter/${this.client.profile.username}/lastPost`,
                 {
@@ -174,15 +213,12 @@ export class TwitterPostClient {
                 }
             );
 
-            // Cache tweet
             await this.client.cacheTweet(tweet);
 
-            // Update timeline
             const homeTimeline = await this.client.getCachedTimeline() || [];
             homeTimeline.unshift(tweet);
             await this.client.cacheTimeline(homeTimeline);
 
-            // Create memory
             const roomId = stringToUuid(tweet.conversationId + "-" + this.runtime.agentId);
             await this.runtime.ensureRoomExists(roomId);
             await this.runtime.ensureParticipantInRoom(this.runtime.agentId, roomId);
@@ -206,17 +242,6 @@ export class TwitterPostClient {
             elizaLogger.error("Error updating caches and memory:", error);
             throw error;
         }
-    };
-
-    #formatTimeline = (tweets: Tweet[]): string => {
-        return `# ${this.runtime.character.name}'s Home Timeline\n\n` +
-            tweets
-                .map((tweet) => (
-                    `#${tweet.id}\n${tweet.name} (@${tweet.username})${
-                        tweet.inReplyToStatusId ? `\nIn reply to: ${tweet.inReplyToStatusId}` : ""
-                    }\n${new Date(tweet.timestamp).toDateString()}\n\n${tweet.text}\n---\n`
-                ))
-                .join("\n");
     };
 
     #generateTweetContent = async (formattedTimeline: string): Promise<string> => {
@@ -250,17 +275,6 @@ export class TwitterPostClient {
 
         return newTweetContent.replaceAll(/\\n/g, "\n").trim();
     };
-
-    // Disabled methods - these methods will immediately return without doing anything
-    async processNewTweet(_tweet: Tweet): Promise<void> {
-        elizaLogger.debug('Tweet processing disabled');
-        return;
-    }
-
-    async reply(_tweet: Tweet, _content: string): Promise<Tweet | null> {
-        elizaLogger.debug('Replies are disabled');
-        return null;
-    }
 
     async start(postImmediately = false): Promise<void> {
         if (this.isRunning) {
@@ -314,6 +328,10 @@ export class TwitterPostClient {
 
     async stop(): Promise<void> {
         this.isRunning = false;
+        // Remove event listeners
+        if (this.runtime.eventEmitter) {
+            this.runtime.eventEmitter.off('*', blockTweetEvents);
+        }
         elizaLogger.log("Twitter post client stopped");
     }
 
@@ -341,7 +359,15 @@ export class TwitterPostClient {
                     homeTimeline = [];
                 }
 
-                const formattedTimeline = this.#formatTimeline(homeTimeline);
+                const formattedTimeline = `# ${this.runtime.character.name}'s Home Timeline\n\n` +
+                    homeTimeline
+                        .map((tweet) => (
+                            `#${tweet.id}\n${tweet.name} (@${tweet.username})${
+                                tweet.inReplyToStatusId ? `\nIn reply to: ${tweet.inReplyToStatusId}` : ""
+                            }\n${new Date(tweet.timestamp).toDateString()}\n\n${tweet.text}\n---\n`
+                        ))
+                        .join("\n");
+
                 content = await this.#generateTweetContent(formattedTimeline);
             }
 
@@ -378,11 +404,80 @@ export class TwitterPostClient {
     }
 }
 
-export function initializeTwitterClient(
-    client: ClientBase, 
-    runtime: IAgentRuntime
-): TwitterPostClient {
-    const twitterClient = new TwitterPostClient(client, runtime);
-    elizaLogger.log("Twitter client initialized (replies disabled)");
-    return twitterClient;
+export class TwitterManager {
+    private client: TwitterPostClient;
+
+    constructor(baseClient: ClientBase, runtime: IAgentRuntime, config?: TwitterClientConfig) {
+        if (config) {
+            if (config.postIntervalMin) {
+                runtime.setSetting("POST_INTERVAL_MIN", config.postIntervalMin.toString());
+            }
+            if (config.postIntervalMax) {
+                runtime.setSetting("POST_INTERVAL_MAX", config.postIntervalMax.toString());
+            }
+            if (config.dryRun) {
+                runtime.setSetting("TWITTER_DRY_RUN", "true");
+            }
+        }
+
+        // Block all tweet-related events at runtime level
+        // Block all tweet-related events at runtime level
+        runtime.on('tweet', () => null);
+        runtime.on('reply', () => null);
+        runtime.on('mention', () => null);
+
+        this.client = new TwitterPostClient(baseClient, runtime);
+    }
+
+    async start(postImmediately: boolean = false): Promise<void> {
+        await this.client.start(postImmediately);
+    }
+
+    async stop(): Promise<void> {
+        await this.client.stop();
+    }
+}
+
+export async function createTwitterClient(
+    baseClient: ClientBase,
+    runtime: IAgentRuntime,
+    config?: TwitterClientConfig
+): Promise<TwitterManager> {
+    // Override any existing event handlers
+    runtime.removeAllListeners('tweet');
+    runtime.removeAllListeners('reply');
+    runtime.removeAllListeners('mention');
+    
+    // Block new event handlers
+    runtime.on('tweet', () => null);
+    runtime.on('reply', () => null);
+    runtime.on('mention', () => null);
+
+    // Create manager with blocked events
+    const manager = new TwitterManager(baseClient, runtime, config);
+    elizaLogger.log("Twitter client initialized with replies disabled");
+    return manager;
+}
+
+// Export additional types and utilities
+export type { Tweet } from "agent-twitter-client";
+export { ClientBase } from "./base";
+
+// Add these exports if needed by other parts of the system
+export const TwitterEventTypes = {
+    TWEET: 'tweet',
+    REPLY: 'reply',
+    MENTION: 'mention',
+} as const;
+
+export interface TwitterEvent {
+    type: typeof TwitterEventTypes[keyof typeof TwitterEventTypes];
+    data: Tweet;
+}
+
+// Helper to check if an event should be blocked
+export function isTweetEvent(event: any): boolean {
+    return event?.type === TwitterEventTypes.TWEET ||
+           event?.type === TwitterEventTypes.REPLY ||
+           event?.type === TwitterEventTypes.MENTION;
 }
