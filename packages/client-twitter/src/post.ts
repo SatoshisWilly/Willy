@@ -144,6 +144,21 @@ export class TwitterPostClient {
 
 private async validateTweetForReply(tweet: Tweet): Promise<boolean> {
     try {
+        // Skip own tweets
+        if (tweet.username === this.client.profile.username) {
+            elizaLogger.debug(`Skipping own tweet ${tweet.id}`);
+            return false;
+        }
+
+        // IMPORTANT: Check if this is a reply to our own tweet
+        if (tweet.inReplyToStatusId) {
+            const parentTweet = await this.client.getTweet(tweet.inReplyToStatusId);
+            if (parentTweet?.username === this.client.profile.username) {
+                elizaLogger.debug(`Skipping reply to our own tweet ${tweet.id}`);
+                return false;
+            }
+        }
+
         // Check tweet age
         const tweetDate = new Date(tweet.timestamp).getTime();
         const ageInMs = Date.now() - tweetDate;
@@ -153,19 +168,19 @@ private async validateTweetForReply(tweet: Tweet): Promise<boolean> {
             return false;
         }
 
-        // Check if we've already replied in this conversation
-        const threadKey = `twitter/${this.client.profile.username}/threads/${tweet.conversationId}`;
-        const threadData = await this.runtime.cacheManager.get<{
-            replies: string[];
-            lastReplyTimestamp: number;
-        }>(threadKey);
-
-        // If we have any replies in this conversation, don't reply again
-        if (threadData && threadData.replies && threadData.replies.length > 0) {
-            elizaLogger.debug(`Already replied in thread ${tweet.conversationId} (${threadData.replies.length} replies)`);
+        // First, check the conversation cache
+        const conversationKey = `twitter/${this.client.profile.username}/conversations/${tweet.conversationId}`;
+        const hasParticipated = await this.runtime.cacheManager.get<boolean>(conversationKey);
+        
+        if (hasParticipated) {
+            elizaLogger.debug(`Already participated in conversation ${tweet.conversationId}`);
             return false;
         }
 
+        // If we get here, immediately mark this conversation as participated
+        // This prevents race conditions where multiple replies might be generated
+        await this.runtime.cacheManager.set(conversationKey, true);
+        
         return true;
     } catch (error) {
         elizaLogger.error("Error validating tweet for reply:", error);
@@ -174,24 +189,21 @@ private async validateTweetForReply(tweet: Tweet): Promise<boolean> {
 }
 private async trackReplyInThread(tweet: Tweet): Promise<void> {
     try {
-        const threadKey = `twitter/${this.client.profile.username}/threads/${tweet.conversationId}`;
+        // Mark conversation as participated
+        const conversationKey = `twitter/${this.client.profile.username}/conversations/${tweet.conversationId}`;
+        await this.runtime.cacheManager.set(conversationKey, true);
         
-        // Get existing thread data if any
-        const existingData = await this.runtime.cacheManager.get<{
-            replies: string[];
-            lastReplyTimestamp: number;
-        }>(threadKey);
+        // Store the reply details
+        const replyKey = `twitter/${this.client.profile.username}/replies/${tweet.id}`;
+        await this.runtime.cacheManager.set(replyKey, {
+            conversationId: tweet.conversationId,
+            timestamp: Date.now(),
+            inReplyTo: tweet.inReplyToStatusId
+        });
 
-        // Create or update thread data
-        const newData = {
-            replies: existingData ? [...existingData.replies, tweet.id] : [tweet.id],
-            lastReplyTimestamp: Date.now()
-        };
-
-        await this.runtime.cacheManager.set(threadKey, newData);
-        elizaLogger.debug(`Tracked reply ${tweet.id} in thread ${tweet.conversationId}`);
+        elizaLogger.debug(`Tracked reply ${tweet.id} in conversation ${tweet.conversationId}`);
     } catch (error) {
-        elizaLogger.error("Error tracking reply in thread:", error);
+        elizaLogger.error("Error tracking reply:", error);
     }
 }
     async start(postImmediately: boolean = false) {
