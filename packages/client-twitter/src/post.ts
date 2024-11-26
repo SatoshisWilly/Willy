@@ -9,8 +9,8 @@ import {
     parseBooleanFromText,
     elizaLogger,
 } from "@ai16z/eliza";
-import { ClientBase } from "./base.ts";
-import { SpecialInteraction, validateTwitterConfig } from "./environment.ts";
+import { ClientBase } from "./base";
+import { SpecialInteraction, validateTwitterConfig } from "./environment";
 import { sample } from 'lodash';
 
 const MAX_TWEET_LENGTH = 280;
