@@ -101,64 +101,69 @@ export class TwitterInteractionClient {
         handleTwitterInteractionsLoop();
     }
 
-    async handleTwitterInteractions() {
-        elizaLogger.log("Checking Twitter interactions");
+async handleTwitterInteractions() {
+    elizaLogger.log("Checking Twitter interactions");
 
-        const twitterUsername = this.client.profile.username;
+    const twitterUsername = this.client.profile.username;
 
-        try {
-            // Fetch recent mentions
-            const tweetCandidates = (
-                await this.client.fetchSearchTweets(
-                    `@${twitterUsername}`,
-                    20,
-                    SearchMode.Latest
-                )
-            ).tweets;
+    try {
+        // Fetch recent mentions
+        const tweetCandidates = (
+            await this.client.fetchSearchTweets(
+                `@${twitterUsername}`,
+                20,
+                SearchMode.Latest
+            )
+        ).tweets;
 
-            const uniqueTweetCandidates = [...new Set(tweetCandidates)]
-                .sort((a, b) => a.id.localeCompare(b.id))
-                .filter(
-                    (tweet) =>
-                        tweet.userId !== this.client.profile.id && // Exclude self-tweets
-                        !this.isSpam(tweet) &&
-                        !(await this.hasRepliedToTweet(tweet.id)) // Exclude already replied tweets
-                );
+        // Deduplicate and sort tweets
+        const uniqueTweetCandidates = [...new Set(tweetCandidates)]
+            .sort((a, b) => a.id.localeCompare(b.id))
+            .filter((tweet) => tweet.userId !== this.client.profile.id); // Exclude self-tweets
 
-            for (const tweet of uniqueTweetCandidates) {
-                if (
-                    !this.client.lastCheckedTweetId ||
-                    parseInt(tweet.id) > this.client.lastCheckedTweetId
-                ) {
-                    elizaLogger.log("New Tweet found", tweet.permanentUrl);
-
-                    const thread = await this.buildConversationThread(tweet);
-
-                    await this.handleTweet({
-                        tweet,
-                        message: {
-                            content: { text: tweet.text },
-                            agentId: this.runtime.agentId,
-                            userId: stringToUuid(tweet.userId!),
-                            roomId: stringToUuid(
-                                tweet.conversationId + "-" + this.runtime.agentId
-                            ),
-                        },
-                        thread,
-                    });
-
-                    // Mark tweet as replied after processing
-                    await this.markTweetAsReplied(tweet.id);
-                }
+        // Filter out tweets asynchronously (e.g., already replied or spam)
+        const filteredCandidates: Tweet[] = [];
+        for (const tweet of uniqueTweetCandidates) {
+            if (!(await this.hasRepliedToTweet(tweet.id)) && !this.isSpam(tweet)) {
+                filteredCandidates.push(tweet);
             }
-
-            // Save the latest checked tweet ID
-            await this.client.cacheLatestCheckedTweetId();
-            elizaLogger.log("Finished checking Twitter interactions");
-        } catch (error) {
-            elizaLogger.error("Error handling Twitter interactions:", error);
         }
+
+        for (const tweet of filteredCandidates) {
+            if (
+                !this.client.lastCheckedTweetId ||
+                parseInt(tweet.id) > this.client.lastCheckedTweetId
+            ) {
+                elizaLogger.log("New Tweet found", tweet.permanentUrl);
+
+                const thread = await this.buildConversationThread(tweet);
+
+                await this.handleTweet({
+                    tweet,
+                    message: {
+                        content: { text: tweet.text },
+                        agentId: this.runtime.agentId,
+                        userId: stringToUuid(tweet.userId!),
+                        roomId: stringToUuid(
+                            tweet.conversationId + "-" + this.runtime.agentId
+                        ),
+                    },
+                    thread,
+                });
+
+                // Mark tweet as replied after processing
+                await this.markTweetAsReplied(tweet.id);
+            }
+        }
+
+        // Save the latest checked tweet ID
+        await this.client.cacheLatestCheckedTweetId();
+        elizaLogger.log("Finished checking Twitter interactions");
+    } catch (error) {
+        elizaLogger.error("Error handling Twitter interactions:", error);
     }
+}
+
 
     private async handleTweet({
         tweet,
